@@ -1,0 +1,388 @@
+/* ======================================================================================
+ * PROJECT: FALCON FLOOD MONITORING - RECEIVER & IoT DASHBOARD
+ * Display: 1.3" I2C OLED (SH1106)
+ * Radio:   SX1278 / SX1276 LoRa Module (433 MHz)
+ * IoT:     Blynk IoT over Wi-Fi
+ * Buzzer:  SAFE = off | WARNING = putol-putol (1s) | DANGER or HEAVY RAIN = solid, walang putol
+ * Payload format expected from transmitter: D:<dist>,T:<temp>,H:<hum>,R:<rain>,A:<ai>
+ * ======================================================================================
+ */
+
+#define BLYNK_TEMPLATE_ID "TMPL68yVUrxP9"
+#define BLYNK_TEMPLATE_NAME "FALCON"
+#define BLYNK_AUTH_TOKEN "tU3aHcKtdw9jh3k6vc95flzxG2BdPxUz"
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// ================== WIFI CREDENTIALS ==================
+char ssid[] = "Falcon17";     // ← Palitan ng Wi-Fi Name / Hotspot SSID
+char pass[] = "rhizacute"; // ← Palitan ng Wi-Fi Password
+// =======================================================
+
+// --- PIN DEFINITIONS ---
+#define SDA_PIN        21
+#define SCL_PIN        22
+
+#define LORA_SCK_PIN   18
+#define LORA_MISO_PIN  19
+#define LORA_MOSI_PIN  23
+#define LORA_SS_PIN    5
+#define LORA_RST_PIN   14
+#define LORA_DIO0_PIN  26
+
+// --- BUZZER CONFIGURATION ---
+#define BUZZER_PIN     25      // ← Palitan kung ibang GPIO ang gamit mo
+#define BUZZER_ACTIVE_HIGH true // set false kung active-low ang buzzer module mo
+
+// --- ULTRASONIC (WATER DISTANCE) ALERT THRESHOLDS ---
+// >= 30cm        -> SAFE
+// 15cm < x < 30cm -> WARNING   (15cm mismo ay itinuring na WARNING dito)
+// <= 14cm        -> DANGER
+const float SAFE_DIST_CM   = 30.0;   // dist >= 30      -> SAFE
+const float DANGER_DIST_CM = 14.0;   // dist <= 14      -> DANGER
+                                      // kung nasa gitna (14 < dist < 30) -> WARNING
+
+// Beep timing (ms) - WARNING lang gumagamit nito (putol-putol); DANGER/HEAVY RAIN ay solid
+const unsigned long WARNING_BEEP_INTERVAL = 1000;  // 1 s on/off habang WARNING
+
+// --- HARDWARE CONFIGURATION ---
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+#define LORA_BAND      433E6
+#define LORA_SYNC_WORD 0x3F
+
+// --- RAIN SENSOR REFERENCE (para sa TRANSMITTER sketch, hindi dito) ---
+// Karaniwang analog rain sensor board (FC-37 / YL-83 + LM393), analogRead() sa ESP32 (0-4095).
+// Mas MATAAS ang value = mas TUYO ang sensor (walang tubig sa plate).
+// I-calibrate muna gamit ang Serial Monitor bago i-finalize ang mga threshold na ito:
+//   CLEAR (walang ulan)  : analogValue > 3000
+//   LIGHT RAIN           : 1500 <= analogValue <= 3000
+//   HEAVY RAIN           : analogValue < 1500
+// (Baligtad ang range kung ibang module/board ang gamit mo - i-verify sa raw readings.)
+
+// --- TELEMETRY VARIABLES ---
+String waterDist    = "--";
+String tempVal      = "--";
+String humVal       = "--";
+String rainStat     = "--";
+String floodAlert   = "WAITING...";
+String aiStatus     = "Normal";
+int lastRSSI        = 0;
+unsigned long packetCount = 0;
+String previousAlert = "";
+
+// --- BUZZER STATE (non-blocking) ---
+bool buzzerOn = false;
+unsigned long buzzerToggleTime = 0;
+
+// Timer para manatiling ONLINE sa Blynk Cloud kahit walang bagong LoRa packet
+BlynkTimer timer;
+
+// --- BUZZER HELPERS ---
+void buzzerWrite(bool state) {
+  digitalWrite(BUZZER_PIN, (state == BUZZER_ACTIVE_HIGH) ? HIGH : LOW);
+}
+
+// I-convert ang water distance (cm) papuntang alert level base sa itinakdang thresholds
+String getAlertLevel(float distCm) {
+  if (distCm <= DANGER_DIST_CM) {
+    return "DANGER";
+  } else if (distCm < SAFE_DIST_CM) {
+    return "WARNING";
+  } else {
+    return "SAFE";
+  }
+}
+
+// I-parse ang isang "KEY:VALUE" token at i-assign sa tamang variable.
+// Dahil KEY-based na ito (D/T/H/R/A) sa halip na basta posisyon sa comma,
+// HINDI na pwedeng mag-shift ang laman papunta sa maling variable
+// (hal. Humidity value na napupunta sa Rain) kahit magbago ang pagkakasunod-sunod.
+void assignField(String key, String value) {
+  key.toUpperCase();
+  value.trim();
+
+  if (key == "D") {
+    // Distance: 0 (o wala) ay karaniwang FAILED/OUT-OF-RANGE ang ultrasonic
+    if (value.length() > 0 && value != "0.0" && value != "0.00" && value != "0") {
+      waterDist = value;
+      floodAlert = getAlertLevel(waterDist.toFloat());
+    } else {
+      Serial.println(F("[WARNING] Invalid DISTANCE reading (0) - hinawakan ang huling alert level."));
+    }
+  } else if (key == "T") {
+    if (value.length() > 0 && value != "0.0" && value != "0.00" && value != "0") {
+      tempVal = value;
+    } else {
+      Serial.println(F("[WARNING] Invalid TEMP reading (0.0) - hinawakan ang huling valid value."));
+    }
+  } else if (key == "H") {
+    if (value.length() > 0 && value != "0.0" && value != "0.00" && value != "0") {
+      humVal = value;
+    } else {
+      Serial.println(F("[WARNING] Invalid HUM reading (0.0) - hinawakan ang huling valid value."));
+    }
+  } else if (key == "R") {
+    if (value.length() > 0) {
+      rainStat = value;
+    } else {
+      Serial.println(F("[WARNING] Invalid/blangkong RAIN reading - hinawakan ang huling status."));
+    }
+  } else if (key == "A") {
+    aiStatus = value;
+  }
+}
+
+// I-split ang buong payload sa mga "KEY:VALUE" token na pinaghihiwalay ng comma,
+// tapos i-assign isa-isa. Hindi na umaasa sa posisyon - kahit anong order,
+// tama pa rin ang mapupuntahan ng bawat value.
+void parsePayload(String data) {
+  int start = 0;
+  int len = data.length();
+
+  while (start < len) {
+    int commaIdx = data.indexOf(',', start);
+    String token;
+    if (commaIdx == -1) {
+      token = data.substring(start);
+      start = len;
+    } else {
+      token = data.substring(start, commaIdx);
+      start = commaIdx + 1;
+    }
+
+    token.trim();
+    int colonIdx = token.indexOf(':');
+    if (colonIdx == -1 || token.length() == 0) {
+      continue; // skip malformed/blangkong token
+    }
+
+    String key   = token.substring(0, colonIdx);
+    String value = token.substring(colonIdx + 1);
+    assignField(key, value);
+  }
+}
+
+// Tinitignan kung ang natanggap na Rain Status ay "HEAVY" (case-insensitive,
+// gumagana kahit "HEAVY RAIN", "Heavy Rain", etc. ang laman ng rainStat)
+bool isHeavyRain(String status) {
+  String s = status;
+  s.toUpperCase();
+  return s.indexOf("HEAVY") >= 0;
+}
+
+// Tinatawag paulit-ulit sa loop() - non-blocking, hindi nakaka-delay sa LoRa/Blynk
+void updateBuzzer() {
+  unsigned long now = millis();
+  bool heavyRain = isHeavyRain(rainStat);
+
+  if (floodAlert == "DANGER" || heavyRain) {
+    // DANGER O HEAVY RAIN: TULOY-TULOY na tunog, walang putol (solid ON)
+    if (!buzzerOn) {
+      buzzerOn = true;
+      buzzerWrite(true);
+    }
+  } else if (floodAlert == "WARNING") {
+    // WARNING: putol-putol na beeping, 1 second interval
+    if (now - buzzerToggleTime >= WARNING_BEEP_INTERVAL) {
+      buzzerOn = !buzzerOn;
+      buzzerWrite(buzzerOn);
+      buzzerToggleTime = now;
+    }
+  } else {
+    // SAFE at walang heavy rain: laging naka-off ang buzzer
+    if (buzzerOn) {
+      buzzerOn = false;
+      buzzerWrite(false);
+    }
+  }
+}
+
+// Render full dashboard sa 1.3" OLED Screen (128x64)
+// Pixel budget (accurate): header(5x7)=y0-9, 4 data rows(6x10)=y10-53,
+// alert bar(inverted, bold)=y54-63. Lahat kasya, walang nagtatapon sa labas ng screen.
+void updateDisplay() {
+  u8g2.clearBuffer();
+
+  // 1. Header: Title + RSSI + Packet Count - magkasama sa IISANG linya, maliit na font (5x7)
+  u8g2.setFont(u8g2_font_5x7_tf);
+  u8g2.setCursor(0, 7);
+  u8g2.print("FALCON RSSI:");
+  u8g2.print(lastRSSI);
+  u8g2.print(" PKT:");
+  u8g2.print(packetCount);
+  u8g2.drawHLine(0, 9, 128);
+
+  // 2-5. Sensor values - malaking font (6x10), isang linya bawat isa (10px apart)
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  u8g2.setCursor(0, 19);
+  u8g2.print("Temp: ");
+  u8g2.print(tempVal);
+  u8g2.print(" C");
+
+  u8g2.setCursor(0, 29);
+  u8g2.print("Hum : ");
+  u8g2.print(humVal);
+  u8g2.print(" %");
+
+  u8g2.setCursor(0, 39);
+  u8g2.print("Dist: ");
+  u8g2.print(waterDist);
+  u8g2.print(" cm");
+
+  u8g2.setCursor(0, 49);
+  u8g2.print("Rain: ");
+  u8g2.print(rainStat);
+
+  u8g2.drawHLine(0, 53, 128);
+
+  // 6. Alert Level - naka-INVERT (puting bar, itim na text) para agad makita
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 54, 128, 10);
+  u8g2.setDrawColor(0);
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.setCursor(2, 62);
+  u8g2.print("ALERT: ");
+  u8g2.print(floodAlert);
+  u8g2.setDrawColor(1); // ibalik sa normal para tama ang susunod na frame
+
+  u8g2.sendBuffer();
+}
+
+// Ipadala ang datos sa Blynk gamit ang iyong Virtual Pin mapping
+void sendToBlynk() {
+  Blynk.virtualWrite(V0, floodAlert);                                                 // Flood Status
+  Blynk.virtualWrite(V1, waterDist.toFloat());                                       // Water Distance (cm)
+  Blynk.virtualWrite(V2, tempVal.toFloat());                                         // Temperature (°C)
+  Blynk.virtualWrite(V3, humVal.toFloat());                                          // Humidity (%)
+  Blynk.virtualWrite(V4, floodAlert);                                                // Alert Status
+  Blynk.virtualWrite(V5, rainStat);                                                  // Rain Sensor Status
+  Blynk.virtualWrite(V6, "FALCON ACTIVE");                                            // FALCON System Status
+  Blynk.virtualWrite(V7, waterDist.toFloat());                                       // FALCON Water Distance
+  Blynk.virtualWrite(V8, lastRSSI);                                                  // RSSI Signal (dBm)
+  Blynk.virtualWrite(V9, packetCount);                                               // Packets Received
+  Blynk.virtualWrite(V10, (floodAlert == "DANGER" ? "FLOOD DETECTED" : "NO FLOOD")); // Flood Detection
+  Blynk.virtualWrite(V11, aiStatus);                                                 // Edge AI Status
+
+  // Push Notification Trigger kapag may DANGER
+  if ((floodAlert == "DANGER" || aiStatus.indexOf("FLOOD") >= 0) && previousAlert != "DANGER") {
+    Blynk.logEvent("flood_danger", "FLOOD DANGER DETECTED!");
+  }
+  previousAlert = floodAlert;
+}
+
+// Heartbeat function para siguradong laging ONLINE ang Blynk device
+void checkBlynkConnection() {
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V6, "FALCON ONLINE");
+    Blynk.virtualWrite(V8, lastRSSI);
+    Blynk.virtualWrite(V9, packetCount);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Initialize Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerWrite(false);
+
+  // Initialize I2C OLED Display
+  Wire.begin(SDA_PIN, SCL_PIN);
+  u8g2.begin();
+  u8g2.setContrast(255);
+
+  // Ipakita ang paunang dashboard layout
+  updateDisplay();
+
+  // Kumonekta sa Wi-Fi at Blynk Cloud
+  Serial.println(F("Connecting to Wi-Fi & Blynk..."));
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  if (Blynk.connected()) {
+    Serial.println(F("[SUCCESS] Connected to Blynk Cloud!"));
+  }
+
+  // Mag-send ng Heartbeat sa Blynk bawat 2 segundo para manatiling ONLINE
+  timer.setInterval(2000L, checkBlynkConnection);
+
+  // LoRa Hardware Reset
+  pinMode(LORA_RST_PIN, OUTPUT);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(10);
+  digitalWrite(LORA_RST_PIN, LOW);  delay(20);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(50);
+
+  // Initialize LoRa SPI Bus
+  LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_SS_PIN);
+  LoRa.setSPIFrequency(2000000);
+
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println(F("[CRITICAL ERROR] SX1278 Initialization Failed!"));
+    while (true) delay(1000);
+  }
+
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+
+  Serial.println(F("=================================================="));
+  Serial.println(F("  FALCON RECEIVER ONLINE & LISTENING             "));
+  Serial.println(F("=================================================="));
+}
+
+void loop() {
+  // Panatilihing active ang Blynk connection at timers
+  Blynk.run();
+  timer.run();
+
+  // I-update ang buzzer state sa bawat loop (non-blocking)
+  updateBuzzer();
+
+  // Mag-check para sa mga pumasok na LoRa packets
+  int packetSize = LoRa.parsePacket();
+
+  if (packetSize) {
+    packetCount++;
+    String incomingData = "";
+
+    // Basahin ang payload data
+    while (LoRa.available()) {
+      incomingData += (char)LoRa.read();
+    }
+
+    lastRSSI = LoRa.packetRssi();
+
+    // Bagong format: KEY:VALUE token, pinaghihiwalay ng comma. Halimbawa:
+    //   D:120.5,T:25.3,H:60.2,R:NO RAIN,A:Normal
+    // Kahit anong pagkakasunod-sunod ang mga token, tama pa rin ang mapupuntahan
+    // ng bawat value dahil naka-label ang bawat isa (D=Distance, T=Temp, H=Hum, R=Rain, A=AI).
+    if (incomingData.indexOf(':') >= 0) {
+      parsePayload(incomingData);
+
+      // Print telemetry log sa Serial Monitor
+      Serial.println(F("--------------------------------------------------"));
+      Serial.printf("[PACKET #%lu] Payload: %s\n", packetCount, incomingData.c_str());
+      Serial.printf("Signal Strength : %d dBm\n", lastRSSI);
+      Serial.printf("Water Distance  : %s cm\n", waterDist.c_str());
+      Serial.printf("Temperature     : %s C\n", tempVal.c_str());
+      Serial.printf("Humidity        : %s %%\n", humVal.c_str());
+      Serial.printf("Rain Status     : %s\n", rainStat.c_str());
+      Serial.printf("Alert Status    : %s\n", floodAlert.c_str());
+
+      // I-update ang OLED Display at ipadala ang datos sa Blynk App
+      updateDisplay();
+      sendToBlynk();
+    } else {
+      Serial.println(F("[WARNING] Payload format error - walang ':' na key sa natanggap na data."));
+    }
+  }
+
+  delay(10);
+}
