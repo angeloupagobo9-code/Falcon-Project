@@ -1,0 +1,569 @@
+/*
+  FALCON FLOOD MONITORING - RECEIVER V2
+  1.3" I2C OLED SH1106 128x64
+  LoRa SX1278/SX1276 433 MHz
+  Blynk IoT (optional)
+
+  Expected transmitter payload:
+    D:<distance_cm>,T:<temp>,H:<humidity>,R:<rain_status>,A:<NORMAL|FLOOD>
+
+  Example:
+    D:28.4,T:26.1,H:81.0,R:HEAVY,A:FLOOD
+
+  IMPORTANT:
+  - Put your own Wi-Fi/Blynk credentials below.
+  - This receiver code does NOT retrain or improve the Edge-AI model itself.
+    It improves the receiver-side reliability by filtering water readings
+    and combining AI + physical water evidence.
+*/
+
+#define BLYNK_TEMPLATE_ID "YOUR_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "FALCON"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_TOKEN"
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "YOUR_WIFI";
+char pass[] = "YOUR_PASSWORD";
+
+// ---------- PINS ----------
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define LORA_SCK_PIN 18
+#define LORA_MISO_PIN 19
+#define LORA_MOSI_PIN 23
+#define LORA_SS_PIN 5
+#define LORA_RST_PIN 14
+#define LORA_DIO0_PIN 26
+
+#define BUZZER_PIN 25
+#define BUZZER_ACTIVE_HIGH true
+
+// ---------- RADIO ----------
+#define LORA_BAND 433E6
+#define LORA_SYNC_WORD 0x3F
+
+// ---------- WATER THRESHOLDS ----------
+// Smaller distance = higher water level.
+const float SAFE_DIST_CM   = 30.0f;
+const float DANGER_DIST_CM = 14.0f;
+
+// Require repeated danger readings before "confirmed" water danger.
+const uint8_t CONFIRM_SAMPLES = 2;
+
+// ---------- TIMERS ----------
+const unsigned long WARNING_BEEP_INTERVAL = 700;
+const unsigned long PACKET_TIMEOUT_MS = 10000;
+const unsigned long DISPLAY_PAGE_MS = 3000;
+const unsigned long BLYNK_INTERVAL_MS = 2000;
+
+// ---------- OLED ----------
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ---------- TELEMETRY ----------
+String waterDist = "--";
+String tempVal = "--";
+String humVal = "--";
+String rainStat = "--";
+String aiStatus = "WAITING";
+
+String systemStatus = "WAITING";
+String fusionStatus = "WAIT";
+
+float filteredDist = NAN;
+float distHistory[3] = {NAN, NAN, NAN};
+uint8_t distIndex = 0;
+
+int lastRSSI = 0;
+unsigned long packetCount = 0;
+unsigned long lastPacketMillis = 0;
+
+uint8_t dangerCount = 0;
+uint8_t aiFloodCount = 0;
+
+bool buzzerOn = false;
+unsigned long buzzerToggleTime = 0;
+
+unsigned long lastDisplayPage = 0;
+uint8_t displayPage = 0;
+
+BlynkTimer timer;
+
+// ---------- HELPERS ----------
+void buzzerWrite(bool state) {
+  digitalWrite(BUZZER_PIN, (state == BUZZER_ACTIVE_HIGH) ? HIGH : LOW);
+}
+
+String upperTrim(String s) {
+  s.trim();
+  s.toUpperCase();
+  return s;
+}
+
+bool isValidNumber(const String &s) {
+  if (s.length() == 0) return false;
+  float v = s.toFloat();
+  return !(isnan(v) || isinf(v));
+}
+
+// Median filter rejects one sudden bad ultrasonic reading.
+float median3(float a, float b, float c) {
+  if (isnan(a)) return isnan(b) ? c : (isnan(c) ? b : (b < c ? b : c));
+  if (isnan(b)) return isnan(c) ? a : (a < c ? a : c);
+  if (isnan(c)) return (a < b ? a : b);
+
+  if (a > b) { float t = a; a = b; b = t; }
+  if (b > c) { float t = b; b = c; c = t; }
+  if (a > b) { float t = a; a = b; b = t; }
+
+  return b;
+}
+
+float updateDistanceFilter(float d) {
+  distHistory[distIndex] = d;
+  distIndex = (distIndex + 1) % 3;
+
+  float m = median3(distHistory[0], distHistory[1], distHistory[2]);
+
+  if (isnan(filteredDist)) {
+    filteredDist = m;
+  } else {
+    // Gentle smoothing without making the system too slow.
+    filteredDist = (0.65f * filteredDist) + (0.35f * m);
+  }
+
+  return filteredDist;
+}
+
+bool isAI_Flood() {
+  String s = upperTrim(aiStatus);
+  return s == "FLOOD" || s.indexOf("FLOOD") >= 0;
+}
+
+bool isHeavyRain() {
+  String s = upperTrim(rainStat);
+  return s.indexOf("HEAVY") >= 0;
+}
+
+bool waterDanger() {
+  return !isnan(filteredDist) && filteredDist <= DANGER_DIST_CM;
+}
+
+bool waterWarning() {
+  return !isnan(filteredDist) &&
+         filteredDist > DANGER_DIST_CM &&
+         filteredDist < SAFE_DIST_CM;
+}
+
+bool packetFresh() {
+  return lastPacketMillis != 0 &&
+         (millis() - lastPacketMillis <= PACKET_TIMEOUT_MS);
+}
+
+// ---------- SENSOR + AI FUSION ----------
+// The receiver does not blindly trust one source.
+//
+// FLOOD:
+//   AI says FLOOD + water is repeatedly at danger level.
+//
+// WARNING:
+//   Only one source indicates danger, or water is rising.
+//
+// SAFE:
+//   No flood evidence.
+//
+// This makes disagreements visible instead of hiding them.
+void updateFusionDecision() {
+  bool wf = waterDanger();
+  bool aw = isAI_Flood();
+
+  if (wf) {
+    if (dangerCount < CONFIRM_SAMPLES) dangerCount++;
+  } else {
+    dangerCount = 0;
+  }
+
+  if (aw) {
+    if (aiFloodCount < CONFIRM_SAMPLES) aiFloodCount++;
+  } else {
+    aiFloodCount = 0;
+  }
+
+  if (!packetFresh()) {
+    systemStatus = "NO DATA";
+    fusionStatus = "LINK LOST";
+    return;
+  }
+
+  if (dangerCount >= CONFIRM_SAMPLES &&
+      aiFloodCount >= CONFIRM_SAMPLES) {
+    systemStatus = "FLOOD";
+    fusionStatus = "CONFIRMED";
+  }
+  else if (wf && aw) {
+    systemStatus = "FLOOD";
+    fusionStatus = "AI+WATER";
+  }
+  else if (wf) {
+    systemStatus = "WARNING";
+    fusionStatus = "WATER HIGH";
+  }
+  else if (aw) {
+    systemStatus = "WARNING";
+    fusionStatus = "AI FLOOD";
+  }
+  else if (waterWarning()) {
+    systemStatus = "WARNING";
+    fusionStatus = "RISING";
+  }
+  else if (isHeavyRain()) {
+    systemStatus = "WARNING";
+    fusionStatus = "HEAVY RAIN";
+  }
+  else {
+    systemStatus = "SAFE";
+    fusionStatus = "NORMAL";
+  }
+}
+
+// ---------- PAYLOAD PARSING ----------
+void assignField(String key, String value) {
+  key = upperTrim(key);
+  value.trim();
+
+  if (key == "D") {
+    if (isValidNumber(value)) {
+      float d = value.toFloat();
+
+      // Reject impossible/obviously invalid HC-SR04 readings.
+      if (d > 0.0f && d < 600.0f) {
+        waterDist = value;
+        updateDistanceFilter(d);
+      } else {
+        Serial.println(F("[WARN] Invalid distance range."));
+      }
+    }
+  }
+  else if (key == "T") {
+    if (isValidNumber(value)) tempVal = value;
+  }
+  else if (key == "H") {
+    if (isValidNumber(value)) humVal = value;
+  }
+  else if (key == "R") {
+    if (value.length()) rainStat = value;
+  }
+  else if (key == "A") {
+    if (value.length()) aiStatus = value;
+  }
+}
+
+void parsePayload(String data) {
+  int start = 0;
+  int len = data.length();
+
+  while (start < len) {
+    int commaIdx = data.indexOf(',', start);
+    String token;
+
+    if (commaIdx == -1) {
+      token = data.substring(start);
+      start = len;
+    } else {
+      token = data.substring(start, commaIdx);
+      start = commaIdx + 1;
+    }
+
+    token.trim();
+
+    int colonIdx = token.indexOf(':');
+    if (colonIdx <= 0) continue;
+
+    String key = token.substring(0, colonIdx);
+    String value = token.substring(colonIdx + 1);
+
+    assignField(key, value);
+  }
+
+  lastPacketMillis = millis();
+  updateFusionDecision();
+}
+
+// ---------- BUZZER ----------
+void updateBuzzer() {
+  unsigned long now = millis();
+
+  // Communication loss is shown on OLED, but does NOT trigger a flood alarm.
+  if (systemStatus == "FLOOD") {
+    if (!buzzerOn) {
+      buzzerOn = true;
+      buzzerWrite(true);
+    }
+  }
+  else if (systemStatus == "WARNING") {
+    if (now - buzzerToggleTime >= WARNING_BEEP_INTERVAL) {
+      buzzerOn = !buzzerOn;
+      buzzerWrite(buzzerOn);
+      buzzerToggleTime = now;
+    }
+  }
+  else {
+    buzzerOn = false;
+    buzzerWrite(false);
+  }
+}
+
+// ---------- OLED ----------
+void drawHeader() {
+  u8g2.setFont(u8g2_font_5x7_tf);
+
+  u8g2.setCursor(0, 7);
+  u8g2.print("FALCON");
+
+  u8g2.setCursor(70, 7);
+  u8g2.print(lastRSSI);
+  u8g2.print("dBm");
+
+  u8g2.drawHLine(0, 9, 128);
+}
+
+void drawStatusBar(const String &text) {
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 52, 128, 12);
+
+  u8g2.setDrawColor(0);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setCursor(2, 61);
+  u8g2.print(text);
+
+  u8g2.setDrawColor(1);
+}
+
+void updateDisplay() {
+  // Two-page dashboard for the small 128x64 OLED.
+  if (millis() - lastDisplayPage >= DISPLAY_PAGE_MS) {
+    displayPage = (displayPage + 1) % 2;
+    lastDisplayPage = millis();
+  }
+
+  u8g2.clearBuffer();
+  drawHeader();
+
+  if (displayPage == 0) {
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    u8g2.setCursor(0, 19);
+    u8g2.print("WATER: ");
+    if (isnan(filteredDist)) {
+      u8g2.print("--");
+    } else {
+      u8g2.print(filteredDist, 1);
+      u8g2.print("cm");
+    }
+
+    u8g2.setCursor(0, 30);
+    u8g2.print("AI: ");
+    u8g2.print(aiStatus);
+
+    u8g2.setCursor(0, 41);
+    u8g2.print("RAIN: ");
+    u8g2.print(rainStat);
+
+    drawStatusBar("STATUS: " + systemStatus);
+  }
+  else {
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    u8g2.setCursor(0, 19);
+    u8g2.print("TEMP: ");
+    u8g2.print(tempVal);
+    u8g2.print(" C");
+
+    u8g2.setCursor(0, 30);
+    u8g2.print("HUM : ");
+    u8g2.print(humVal);
+    u8g2.print("%");
+
+    u8g2.setCursor(0, 41);
+    u8g2.print("AI/W: ");
+    u8g2.print(fusionStatus);
+
+    drawStatusBar("PKT: " + String(packetCount));
+  }
+
+  u8g2.sendBuffer();
+}
+
+// ---------- BLYNK ----------
+void sendToBlynk() {
+  if (!Blynk.connected()) return;
+
+  Blynk.virtualWrite(V0, systemStatus);
+  Blynk.virtualWrite(V1, isValidNumber(waterDist) ? waterDist.toFloat() : 0);
+  Blynk.virtualWrite(V2, isValidNumber(tempVal) ? tempVal.toFloat() : 0);
+  Blynk.virtualWrite(V3, isValidNumber(humVal) ? humVal.toFloat() : 0);
+  Blynk.virtualWrite(V4, systemStatus);
+  Blynk.virtualWrite(V5, rainStat);
+  Blynk.virtualWrite(V6, packetFresh() ? "FALCON ONLINE" : "NO DATA");
+  Blynk.virtualWrite(V7, isValidNumber(waterDist) ? waterDist.toFloat() : 0);
+  Blynk.virtualWrite(V8, lastRSSI);
+  Blynk.virtualWrite(V9, packetCount);
+  Blynk.virtualWrite(V10,
+                     systemStatus == "FLOOD"
+                       ? "FLOOD DETECTED"
+                       : "NO CONFIRMED FLOOD");
+  Blynk.virtualWrite(V11, aiStatus);
+  Blynk.virtualWrite(V12, fusionStatus);
+
+  static String previousStatus = "";
+
+  if (systemStatus == "FLOOD" && previousStatus != "FLOOD") {
+    Blynk.logEvent("flood_danger", "FALCON: FLOOD CONFIRMED");
+  }
+
+  previousStatus = systemStatus;
+}
+
+void checkBlynkConnection() {
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V6,
+                       packetFresh()
+                         ? "FALCON ONLINE"
+                         : "RADIO NO DATA");
+    Blynk.virtualWrite(V8, lastRSSI);
+    Blynk.virtualWrite(V9, packetCount);
+  }
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerWrite(false);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  u8g2.begin();
+  u8g2.setContrast(255);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(10, 30, "FALCON V2");
+  u8g2.sendBuffer();
+  delay(800);
+
+  // LoRa starts independently of Blynk.
+  pinMode(LORA_RST_PIN, OUTPUT);
+
+  digitalWrite(LORA_RST_PIN, HIGH);
+  delay(10);
+  digitalWrite(LORA_RST_PIN, LOW);
+  delay(20);
+  digitalWrite(LORA_RST_PIN, HIGH);
+  delay(50);
+
+  LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_SS_PIN);
+  LoRa.setSPIFrequency(2000000);
+
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println(F("[CRITICAL] LoRa init failed."));
+
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 25, "LORA ERROR");
+    u8g2.sendBuffer();
+
+    while (true) {
+      buzzerWrite(false);
+      delay(1000);
+    }
+  }
+
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+
+  // Wi-Fi/Blynk is optional. OLED + LoRa still work without Internet.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+
+  unsigned long wifiStart = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - wifiStart < 8000) {
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(3000);
+  }
+
+  timer.setInterval(BLYNK_INTERVAL_MS, sendToBlynk);
+
+  Serial.println(F("FALCON RECEIVER V2 READY"));
+  updateDisplay();
+}
+
+// ---------- LOOP ----------
+void loop() {
+  // Never block LoRa waiting for cloud connection.
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  }
+
+  timer.run();
+
+  // Show NO DATA if the transmitter disappears.
+  if (!packetFresh() && lastPacketMillis != 0) {
+    updateFusionDecision();
+  }
+
+  updateBuzzer();
+
+  int packetSize = LoRa.parsePacket();
+
+  if (packetSize) {
+    packetCount++;
+
+    String incomingData;
+
+    while (LoRa.available()) {
+      incomingData += (char)LoRa.read();
+    }
+
+    lastRSSI = LoRa.packetRssi();
+
+    Serial.println(F("------------------------------------------"));
+    Serial.printf("[PACKET #%lu] %s\n",
+                  packetCount,
+                  incomingData.c_str());
+    Serial.printf("RSSI: %d dBm\n", lastRSSI);
+
+    if (incomingData.indexOf(':') >= 0) {
+      parsePayload(incomingData);
+      updateFusionDecision();
+      updateDisplay();
+      sendToBlynk();
+    } else {
+      Serial.println(F("[WARN] Invalid payload: missing KEY:VALUE."));
+    }
+  }
+
+  // Refresh display between packets.
+  static unsigned long lastScreenRefresh = 0;
+
+  if (millis() - lastScreenRefresh >= 250) {
+    updateDisplay();
+    lastScreenRefresh = millis();
+  }
+
+  delay(2);
+}
