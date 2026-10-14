@@ -1,0 +1,217 @@
+/*
+  FALCON TRANSMITTER - FINAL (matches FALCON RECEIVER V2)
+  ESP32 Dev Board + SX1278 (433 MHz)
+  Sensors: HC-SR04, DHT11 (3-pin module), rain module
+
+  Payload:
+    D:<distance_cm>,T:<temp>,H:<humidity>,R:<DRY|LIGHT|HEAVY>,A:<NORMAL|FLOOD>
+
+  - A failed sensor is left out of the packet (nothing is fabricated).
+  - A is a rule based on the ultrasonic distance (not an AI result),
+    and is only sent when D is valid.
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Bonezegei_DHT11.h>
+
+// ---------- LoRa (identical to the receiver) ----------
+#define LORA_SCK_PIN   18
+#define LORA_MISO_PIN  19
+#define LORA_MOSI_PIN  23
+#define LORA_SS_PIN     5
+#define LORA_RST_PIN   14
+#define LORA_DIO0_PIN  26
+#define LORA_BAND      433E6
+#define LORA_SYNC_WORD 0x3F
+
+// ---------- Sensor pins ----------
+#define DHT_PIN        4
+#define TRIG_PIN      16
+#define ECHO_PIN      17
+#define RAIN_ADC_PIN  35   // ADC1, input only
+#define RAIN_PWR_PIN  32
+
+// ---------- Settings ----------
+const unsigned long SEND_INTERVAL_MS = 3000;   // receiver timeout is 10 s
+
+// HC-SR04
+constexpr uint8_t US_SAMPLES = 3;
+const float US_MIN_CM = 2.0f;
+const float US_MAX_CM = 400.0f;
+const unsigned long ECHO_TIMEOUT_US = 30000;
+
+// Flood flag from distance (smaller distance = higher water)
+const float FLOOD_ON_CM  = 14.0f;   // matches receiver DANGER_DIST_CM
+const float FLOOD_OFF_CM = 18.0f;   // hysteresis so it does not flicker
+
+// Rain module analog output: LOWER value = WETTER. CALIBRATE THESE.
+const int RAIN_RAW_LIGHT = 3000;
+const int RAIN_RAW_HEAVY = 1500;
+
+Bonezegei_DHT11 dht(DHT_PIN);
+
+unsigned long lastSendMs = 0;
+unsigned long packetId = 0;
+bool floodFlag = false;
+
+// ---------- Helpers ----------
+int readRainRaw() {
+  digitalWrite(RAIN_PWR_PIN, HIGH);
+  delay(10);                         // let the sensor settle
+  long total = 0;
+  for (int i = 0; i < 10; i++) {
+    total += analogRead(RAIN_ADC_PIN);
+    delay(2);
+  }
+  digitalWrite(RAIN_PWR_PIN, LOW);   // power off to reduce corrosion
+  return total / 10;
+}
+
+float readDistanceOnce() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long dur = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+  if (dur == 0) return NAN;          // timeout / no echo
+  float cm = dur * 0.0343f / 2.0f;
+  if (cm < US_MIN_CM || cm > US_MAX_CM) return NAN;
+  return cm;
+}
+
+bool readDistance(float &out) {
+  float v[US_SAMPLES];
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < US_SAMPLES; i++) {
+    float d = readDistanceOnce();
+    if (!isnan(d)) v[n++] = d;
+    if (i < US_SAMPLES - 1) delay(60);   // HC-SR04 needs ~60 ms between pings
+  }
+  if (n < 2) return false;               // need at least 2 valid samples
+  for (uint8_t i = 1; i < n; i++) {      // insertion sort
+    float key = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = key;
+  }
+  out = v[n / 2];                        // median
+  return true;
+}
+
+bool readDHT(float &t, float &h) {
+  if (!dht.getData()) return false;
+  t = dht.getTemperature();
+  h = dht.getHumidity();
+  if (isnan(t) || isnan(h) || t < -10 || t > 60 || h < 1 || h > 100) return false;
+  return true;
+}
+
+const char *rainStatus(int raw) {
+  if (raw < RAIN_RAW_HEAVY) return "HEAVY";
+  if (raw < RAIN_RAW_LIGHT) return "LIGHT";
+  return "DRY";
+}
+
+void addField(String &p, const String &kv) {
+  if (p.length()) p += ',';
+  p += kv;
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RAIN_PWR_PIN, OUTPUT);
+  digitalWrite(RAIN_PWR_PIN, LOW);
+  analogSetPinAttenuation(RAIN_ADC_PIN, ADC_11db);
+
+  dht.begin();
+
+  // Same reset sequence as the receiver
+  pinMode(LORA_RST_PIN, OUTPUT);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(10);
+  digitalWrite(LORA_RST_PIN, LOW);  delay(20);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(50);
+
+  LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_SS_PIN);
+  LoRa.setSPIFrequency(2000000);
+
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println(F("[CRITICAL] LoRa init failed. Check wiring/antenna. Restarting in 5 s..."));
+    delay(5000);
+    ESP.restart();
+  }
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+
+  Serial.println(F("FALCON TRANSMITTER READY"));
+}
+
+// ---------- Loop ----------
+void loop() {
+  if (millis() - lastSendMs < SEND_INTERVAL_MS) return;
+  lastSendMs = millis();
+
+  String payload;
+
+  // 1) Ultrasonic distance -> D (and flood flag -> A)
+  float distCm = NAN;
+  bool distOk = readDistance(distCm);
+  if (distOk) {
+    addField(payload, "D:" + String(distCm, 1));
+
+    if (!floodFlag && distCm <= FLOOD_ON_CM) floodFlag = true;
+    if (floodFlag && distCm >= FLOOD_OFF_CM) floodFlag = false;
+
+    Serial.printf("[HC-SR04] %.1f cm -> %s\n", distCm, floodFlag ? "FLOOD" : "NORMAL");
+  } else {
+    Serial.println(F("[HC-SR04] FAILED - D and A omitted"));
+  }
+
+  // 2) DHT11 -> T, H
+  float temp, hum;
+  if (readDHT(temp, hum)) {
+    addField(payload, "T:" + String(temp, 1));
+    addField(payload, "H:" + String(hum, 1));
+    Serial.printf("[DHT11] %.1f C, %.1f %%\n", temp, hum);
+  } else {
+    Serial.println(F("[DHT11] FAILED - T and H omitted"));
+  }
+
+  // 3) Rain sensor -> R
+  int rainRaw = readRainRaw();
+  const char *rain = rainStatus(rainRaw);
+  addField(payload, "R:" + String(rain));
+  Serial.printf("[RAIN] raw=%d -> %s\n", rainRaw, rain);
+
+  // 4) A field (only when the distance reading was valid)
+  if (distOk) {
+    addField(payload, String("A:") + (floodFlag ? "FLOOD" : "NORMAL"));
+  }
+
+  // 5) Transmit
+  if (payload.length() == 0 || payload.length() > 200) {
+    Serial.println(F("[LORA] Nothing valid to send, skipping."));
+    return;
+  }
+
+  LoRa.beginPacket();
+  size_t written = LoRa.print(payload);
+  int ok = LoRa.endPacket();         // returns 1 on success
+
+  if (ok == 1 && written == payload.length()) {
+    packetId++;
+    Serial.printf("[LORA] Sent #%lu: %s\n", packetId, payload.c_str());
+  } else {
+    Serial.println(F("[LORA] TRANSMIT FAILED"));
+  }
+  Serial.println(F("------------------------------------------"));
+}
