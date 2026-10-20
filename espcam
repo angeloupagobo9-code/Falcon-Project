@@ -1,0 +1,549 @@
+/* ============================================================
+   FALCON EDGE AI CAMERA - PROFESSIONAL VERSION
+   Live Camera + Edge Impulse + Beautiful Dashboard + Blynk
+   Labels: FLOOD / RISING WATER LEVEL / NORMAL
+   ============================================================ */
+
+#define BLYNK_TEMPLATE_ID     "TMPL68yVUrxP9"
+#define BLYNK_TEMPLATE_NAME   "FALCON"
+#define BLYNK_AUTH_TOKEN      "tU3aHcKtdw9jh3k6vc95flzxG2BdPxUz"
+
+#include <angelou14-project-2_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <BlynkSimpleEsp32.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ================== WIFI ==================
+const char* WIFI_SSID     = "Iphone 18 Pro Max";
+const char* WIFI_PASSWORD = "";
+
+// ================== CAMERA PINS (AI Thinker) ==================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS  320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS  240
+#define EI_CAMERA_FRAME_BYTE_SIZE        3
+
+WebServer server(80);
+BlynkTimer timer;
+
+static bool is_initialised = false;
+uint8_t *snapshot_buf = nullptr;
+
+String topLabel = "NORMAL";
+float topConfidence = 0.0f;
+String allResultsHtml = "";
+String statusClass = "normal";
+String statusText = "NORMAL CONDITION";
+String statusNote = "Water level is stable. No immediate threat detected.";
+
+bool photoCaptured = false;
+int photoCount = 0;
+String lastPhotoStatus = "No alert photo yet";
+unsigned long lastPhotoMillis = 0;
+const unsigned long PHOTO_COOLDOWN = 12000;
+
+String currentAiStatus = "NORMAL";
+int aiConfidenceScore = 0;
+
+static camera_config_t camera_config = {
+  .pin_pwdn = PWDN_GPIO_NUM,
+  .pin_reset = RESET_GPIO_NUM,
+  .pin_xclk = XCLK_GPIO_NUM,
+  .pin_sscb_sda = SIOD_GPIO_NUM,
+  .pin_sscb_scl = SIOC_GPIO_NUM,
+  .pin_d7 = Y9_GPIO_NUM,
+  .pin_d6 = Y8_GPIO_NUM,
+  .pin_d5 = Y7_GPIO_NUM,
+  .pin_d4 = Y6_GPIO_NUM,
+  .pin_d3 = Y5_GPIO_NUM,
+  .pin_d2 = Y4_GPIO_NUM,
+  .pin_d1 = Y3_GPIO_NUM,
+  .pin_d0 = Y2_GPIO_NUM,
+  .pin_vsync = VSYNC_GPIO_NUM,
+  .pin_href = HREF_GPIO_NUM,
+  .pin_pclk = PCLK_GPIO_NUM,
+  .xclk_freq_hz = 20000000,
+  .ledc_timer = LEDC_TIMER_0,
+  .ledc_channel = LEDC_CHANNEL_0,
+  .pixel_format = PIXFORMAT_JPEG,
+  .frame_size = FRAMESIZE_QVGA,
+  .jpeg_quality = 10,
+  .fb_count = 2,
+  .fb_location = CAMERA_FB_IN_PSRAM,
+  .grab_mode = CAMERA_GRAB_LATEST
+};
+
+bool ei_camera_init(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
+void handleRoot();
+void handleStream();
+void handleCapturedPhoto();
+void connectWiFi();
+void captureAlertPhoto(String reason);
+void sendToBlynk();
+void updateStatus(String label, int conf);
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout
+
+  Serial.begin(115200);
+  delay(800);
+  Serial.println("\n============================================");
+  Serial.println("   FALCON EDGE AI - PROFESSIONAL VERSION");
+  Serial.println("============================================");
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+  }
+
+  if (!ei_camera_init()) {
+    Serial.println("Camera initialization failed!");
+  } else {
+    Serial.println("Camera initialized successfully");
+  }
+
+  connectWiFi();
+
+  server.on("/", handleRoot);
+  server.on("/stream", handleStream);
+  server.on("/capture", handleCapturedPhoto);
+  server.begin();
+
+  timer.setInterval(3000L, sendToBlynk);
+
+  Serial.println("Dashboard ready!");
+  Serial.print("Open: http://");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  }
+  timer.run();
+  server.handleClient();
+
+  static unsigned long lastAI = 0;
+  if (millis() - lastAI < 2800) return;
+  lastAI = millis();
+
+  snapshot_buf = (uint8_t*)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+  if (!snapshot_buf) return;
+
+  ei::signal_t signal;
+  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  signal.get_data = &ei_camera_get_data;
+
+  if (!ei_camera_capture(EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf)) {
+    free(snapshot_buf);
+    return;
+  }
+
+  ei_impulse_result_t result = {0};
+  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) {
+    free(snapshot_buf);
+    return;
+  }
+
+  // Find best result
+  float maxVal = -1.0f;
+  int maxIdx = 0;
+  String resultsHtml = "";
+
+  for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    float val = result.classification[i].value;
+    if (val > maxVal) {
+      maxVal = val;
+      maxIdx = i;
+    }
+    int pct = (int)(val * 100.0f);
+    resultsHtml += "<div class='pred-item'>";
+    resultsHtml += "<div class='pred-header'><span>" + String(ei_classifier_inferencing_categories[i]) + "</span>";
+    resultsHtml += "<span class='pct'>" + String(pct) + "%</span></div>";
+    resultsHtml += "<div class='bar-bg'><div class='bar-fill' style='width:" + String(pct) + "%'></div></div></div>";
+  }
+
+  topLabel = String(ei_classifier_inferencing_categories[maxIdx]);
+  topConfidence = maxVal;
+  allResultsHtml = resultsHtml;
+
+  int confPct = (int)(topConfidence * 100.0f);
+  updateStatus(topLabel, confPct);
+
+  currentAiStatus = topLabel;
+  aiConfidenceScore = confPct;
+
+  Serial.printf("AI: %s | Confidence: %d%%\n", topLabel.c_str(), confPct);
+
+  // Auto capture photo on important detection
+  String lower = topLabel;
+  lower.toLowerCase();
+  bool shouldCapture = false;
+  String reason = "";
+
+  if (lower.indexOf("flood") >= 0 && confPct >= 45) {
+    shouldCapture = true;
+    reason = "FLOOD DETECTED";
+  } else if (lower.indexOf("rising") >= 0 && confPct >= 45) {
+    shouldCapture = true;
+    reason = "RISING WATER LEVEL";
+  }
+
+  if (shouldCapture && (millis() - lastPhotoMillis > PHOTO_COOLDOWN)) {
+    captureAlertPhoto(reason);
+    lastPhotoMillis = millis();
+  }
+
+  free(snapshot_buf);
+}
+
+void updateStatus(String label, int conf) {
+  String lower = label;
+  lower.toLowerCase();
+
+  if (lower.indexOf("flood") >= 0 && conf >= 40) {
+    statusClass = "critical";
+    statusText = "FLOOD DETECTED";
+    statusNote = "Critical flood condition detected. Immediate attention required!";
+  } 
+  else if (lower.indexOf("rising") >= 0 && conf >= 40) {
+    statusClass = "warning";
+    statusText = "RISING WATER LEVEL";
+    statusNote = "Water level is rising. Continuous monitoring active.";
+  } 
+  else {
+    statusClass = "normal";
+    statusText = "NORMAL CONDITION";
+    statusNote = "Water level is stable. No immediate threat detected.";
+  }
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 25) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect();
+  } else {
+    Serial.println("\nWiFi Connection Failed!");
+  }
+}
+
+void sendToBlynk() {
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V13, currentAiStatus);      // AI Detection
+    Blynk.virtualWrite(V14, aiConfidenceScore);    // AI Confidence
+    Blynk.virtualWrite(V11, currentAiStatus);      // Edge AI Status
+    Serial.println("[Blynk] Data sent");
+  }
+}
+
+void captureAlertPhoto(String reason) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  if (SPIFFS.exists("/alert.jpg")) SPIFFS.remove("/alert.jpg");
+
+  File file = SPIFFS.open("/alert.jpg", FILE_WRITE);
+  if (file) {
+    file.write(fb->buf, fb->len);
+    file.close();
+    photoCount++;
+    photoCaptured = true;
+    lastPhotoStatus = reason;
+    Serial.println(">>> ALERT PHOTO CAPTURED: " + reason);
+  }
+  esp_camera_fb_return(fb);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  server.sendContent(response);
+
+  while (client.connected()) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    client.print("--frame\r\n");
+    client.print("Content-Type: image/jpeg\r\n\r\n");
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+    esp_camera_fb_return(fb);
+
+    if (!client.connected()) break;
+    delay(50);
+  }
+}
+
+void handleCapturedPhoto() {
+  if (SPIFFS.exists("/alert.jpg")) {
+    File file = SPIFFS.open("/alert.jpg", "r");
+    server.streamFile(file, "image/jpeg");
+    file.close();
+  } else {
+    server.send(404, "text/plain", "No alert photo yet");
+  }
+}
+
+void handleRoot() {
+  int confPct = (int)(topConfidence * 100.0f);
+  String photoInfo = photoCaptured ? (lastPhotoStatus + " • " + String(photoCount) + " photos") : "No alert photo yet";
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FALCON EDGE AI</title>
+<meta http-equiv="refresh" content="4">
+<style>
+  :root {
+    --bg: #060a10;
+    --card: #0d1520;
+    --border: #1a2736;
+    --green: #10b981;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 18px; }
+  .container { max-width: 1150px; margin: 0 auto; }
+
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    background: linear-gradient(135deg, #0c1520, #111c2a);
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 16px 22px; margin-bottom: 18px;
+  }
+  .header h1 { font-size: 22px; font-weight: 800; }
+  .header h1 span { color: var(--green); }
+  .header .sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
+  .online { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--green); }
+  .dot { width: 8px; height: 8px; background: var(--green); border-radius: 50%; box-shadow: 0 0 8px var(--green); }
+
+  .main-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 18px; margin-bottom: 18px; }
+  @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+
+  .camera-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; overflow: hidden;
+  }
+  .camera-card img { width: 100%; display: block; background: #000; min-height: 260px; object-fit: cover; }
+  .cam-label {
+    padding: 10px 14px; font-size: 12px; color: var(--muted);
+    border-top: 1px solid var(--border); display: flex; justify-content: space-between;
+  }
+
+  .status-card {
+    padding: 22px; border-radius: 16px; border: 2px solid; text-align: center; margin-bottom: 14px;
+  }
+  .status-card.normal { background: linear-gradient(135deg, #0a1f18, #0d1520); border-color: #10b981; }
+  .status-card.warning { background: linear-gradient(135deg, #1f1608, #0d1520); border-color: #f59e0b; }
+  .status-card.critical { background: linear-gradient(135deg, #1f0a0a, #0d1520); border-color: #ef4444; }
+
+  .status-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .status-value { font-size: 26px; font-weight: 800; margin: 10px 0 6px; }
+  .status-card.normal .status-value { color: #10b981; }
+  .status-card.warning .status-value { color: #f59e0b; }
+  .status-card.critical .status-value { color: #ef4444; }
+  .status-note { font-size: 13px; color: var(--muted); }
+
+  .info-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+  .info-box {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 14px; text-align: center;
+  }
+  .info-box .label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .info-box .value { font-size: 17px; font-weight: 700; margin-top: 5px; color: var(--green); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 16px;
+  }
+  .card-title { font-size: 12px; font-weight: 700; color: var(--green); margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  .pred-item { margin-bottom: 12px; }
+  .pred-header { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+  .pct { font-family: monospace; color: var(--green); font-weight: 600; }
+  .bar-bg { height: 8px; background: #1a2535; border-radius: 6px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, #059669, #10b981); border-radius: 6px; }
+
+  .photo-section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; overflow: hidden; margin-top: 6px;
+  }
+  .photo-header { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .photo-header .title { font-size: 13px; font-weight: 700; color: var(--green); }
+  .photo-header .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .photo-section img { width: 100%; display: block; max-height: 220px; object-fit: cover; background: #000; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <div>
+      <h1>FALCON <span>EDGE AI</span></h1>
+      <div class="sub">Live Camera + Edge Impulse + Auto Photo Capture</div>
+    </div>
+    <div class="online"><div class="dot"></div> System Online</div>
+  </div>
+
+  <div class="main-grid">
+    <div class="camera-card">
+      <img src="/stream" alt="Live Camera Feed">
+      <div class="cam-label">
+        <span>Live Camera Feed</span>
+        <span>Stream Active</span>
+      </div>
+    </div>
+
+    <div>
+      <div class="status-card )rawliteral";
+  html += statusClass;
+  html += R"rawliteral(">
+        <div class="status-label">Current Status</div>
+        <div class="status-value">)rawliteral";
+  html += statusText;
+  html += R"rawliteral(</div>
+        <div class="status-note">)rawliteral";
+  html += statusNote;
+  html += R"rawliteral(</div>
+      </div>
+
+      <div class="info-row">
+        <div class="info-box">
+          <div class="label">AI Prediction</div>
+          <div class="value">)rawliteral";
+  html += topLabel;
+  html += R"rawliteral(</div>
+        </div>
+        <div class="info-box">
+          <div class="label">Confidence</div>
+          <div class="value">)rawliteral";
+  html += String(confPct) + "%";
+  html += R"rawliteral(</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Classification Results</div>
+)rawliteral";
+  html += allResultsHtml;
+  html += R"rawliteral(
+      </div>
+    </div>
+  </div>
+
+  <div class="photo-section">
+    <div class="photo-header">
+      <div class="title">LAST ALERT PHOTO</div>
+      <div class="sub">)rawliteral";
+  html += photoInfo;
+  html += R"rawliteral(</div>
+    </div>
+    <img src="/capture?t=)rawliteral";
+  html += String(millis());
+  html += R"rawliteral(" onerror="this.style.display='none'">
+  </div>
+
+</div>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+// ================== CAMERA ==================
+bool ei_camera_init(void) {
+  if (is_initialised) return true;
+  esp_err_t err = esp_camera_init(&camera_config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -1);
+  }
+  is_initialised = true;
+  return true;
+}
+
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+  if (!is_initialised) return false;
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return false;
+
+  bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+  esp_camera_fb_return(fb);
+  if (!converted) return false;
+
+  if (img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS || img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS) {
+    ei::image::processing::crop_and_interpolate_rgb888(
+      out_buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+      out_buf, img_width, img_height);
+  }
+  return true;
+}
+
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+  size_t pixel_ix = offset * 3;
+  size_t pixels_left = length;
+  size_t out_ptr_ix = 0;
+  while (pixels_left != 0) {
+    out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
+    out_ptr_ix++;
+    pixel_ix += 3;
+    pixels_left--;
+  }
+  return 0;
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
+#error "Invalid model for current sensor"
+#endif
