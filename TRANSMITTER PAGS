@@ -1,0 +1,354 @@
+/*
+  FALCON FLOOD MONITORING - TRANSMITTER V2.1
+  Board : ESP32 Dev Module
+  Radio : LoRa SX1276/78 433 MHz  (Sandeep Mistry "LoRa" library)
+  DHT11 : Bonezegei DHT11 library
+
+  Packet (matches FALCON RECEIVER V2 exactly):
+    D:<distance_cm>,T:<temp_C>,H:<humidity_%>,R:<DRY|LIGHT|HEAVY>,A:<NORMAL|FLOOD>
+  Example:
+    D:28.4,T:26.1,H:81.0,R:HEAVY,A:FLOOD
+
+  Rules:
+  - No sensor value is ever invented. If DHT11 fails, T and H are omitted.
+  - If the ultrasonic fails, NO packet is sent (receiver shows LINK LOST).
+  - Water-level strip sensor is shown on Serial only (receiver has no field).
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Bonezegei_DHT11.h>
+
+// ======================= USER CONFIG =======================
+// ---- LoRa (identical to receiver) ----
+#define LORA_SCK_PIN    18
+#define LORA_MISO_PIN   19
+#define LORA_MOSI_PIN   23
+#define LORA_SS_PIN     5
+#define LORA_RST_PIN    14
+#define LORA_DIO0_PIN   26
+#define LORA_BAND       433E6
+#define LORA_SYNC_WORD  0x3F
+
+// ---- Sensors ----
+#define DHT_PIN         4
+#define TRIG_PIN        13
+#define ECHO_PIN        27     // HC-SR04 ECHO is 5V -> use 1k/2k divider
+#define RAIN_AO_PIN     34     // ADC1, input only
+#define WATER_AO_PIN    35     // ADC1, input only
+#define WATER_PWR_PIN   32     // water sensor powered only while reading
+
+// ---- Timing ----
+const unsigned long SEND_INTERVAL_MS = 3000;  // receiver timeout is 10 s
+const unsigned long DHT_INTERVAL_MS  = 2000;  // DHT11 needs >= 1 s between reads
+
+// ---- Thresholds (same as receiver) ----
+const float DANGER_DIST_CM = 14.0f;
+const float AI_RELEASE_MARGIN_CM = 2.0f;      // FLOOD releases at >= 16 cm
+const uint8_t AI_CONFIRM_SAMPLES = 1;         // receiver already confirms 2x
+
+// ---- Ultrasonic ----
+const float   SENSOR_HEIGHT_CM = 0.0f;        // sensor to channel bottom; 0 = off
+const float   US_MIN_CM = 2.0f;
+const float   US_MAX_CM = 400.0f;
+const uint8_t US_SAMPLES = 5;
+const uint8_t US_MIN_VALID = 3;
+
+// ---- Rain sensor (analog: LOWER value = WETTER). CALIBRATE THESE ----
+const int RAIN_DRY_ABOVE   = 3000;            // raw > this -> DRY
+const int RAIN_HEAVY_BELOW = 1500;            // raw < this -> HEAVY
+
+// ---- Water-level strip calibration (Serial only). CALIBRATE THESE ----
+const int WATER_RAW_DRY  = 0;                 // reading fully dry
+const int WATER_RAW_FULL = 2500;              // reading fully submerged
+
+// ---- Optional extra key; receiver ignores it. Keep false unless approved ----
+#define SEND_WATER_LEVEL_FIELD false
+
+// ---- LoRa recovery ----
+const uint8_t TX_FAILS_BEFORE_REINIT = 3;
+// ===========================================================
+
+Bonezegei_DHT11 dht(DHT_PIN);
+
+float lastTempC = NAN;
+float lastHum   = NAN;
+bool  dhtValid  = false;
+
+unsigned long lastSend = 0;
+unsigned long lastDht = 0;
+unsigned long packetsSent = 0;
+unsigned long packetsSkipped = 0;
+uint8_t consecutiveTxFails = 0;
+
+// ---------------- helpers ----------------
+int readAnalogAvg(uint8_t pin, uint8_t n = 8) {
+  long sum = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return (int)(sum / n);
+}
+
+float medianOf(float *v, uint8_t n) {
+  for (uint8_t i = 1; i < n; i++) {          // insertion sort
+    float key = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = key;
+  }
+  return (n % 2) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0f;
+}
+
+// ---------------- ultrasonic ----------------
+float readDistanceOnce(float tempC) {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long us = pulseIn(ECHO_PIN, HIGH, 30000UL);   // 30 ms timeout
+  if (us == 0) return NAN;
+
+  float speed = 331.4f + 0.606f * (isnan(tempC) ? 25.0f : tempC);  // m/s
+  float cm = (us * speed / 10000.0f) / 2.0f;
+  if (cm < US_MIN_CM || cm > US_MAX_CM) return NAN;
+  return cm;
+}
+
+float readDistanceCm() {
+  float v[US_SAMPLES];
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < US_SAMPLES; i++) {
+    float d = readDistanceOnce(dhtValid ? lastTempC : NAN);
+    if (!isnan(d)) v[n++] = d;
+    delay(25);                                // let echoes die out
+  }
+  if (n < US_MIN_VALID) return NAN;
+  return medianOf(v, n);
+}
+
+const char* gradeWaterByDistance(float distCm) {
+  if (distCm <= DANGER_DIST_CM) return "DANGER";
+  if (distCm < 30.0f)           return "WARNING";
+  return "SAFE";
+}
+
+// ---------------- DHT11 (Bonezegei) ----------------
+void updateDht() {
+  if (lastDht != 0 && millis() - lastDht < DHT_INTERVAL_MS) return;
+  lastDht = millis();
+
+  if (!dht.getData()) {
+    dhtValid = false;
+    Serial.println(F("[WARN] DHT11 read failed - T/H omitted."));
+    return;
+  }
+
+  float t = dht.getTemperature();
+  float h = (float)dht.getHumidity();
+
+  // Only reject physically impossible values (DHT11 can read >90% in rain).
+  if (isnan(t) || isnan(h) || t < -10.0f || t > 60.0f || h < 0.0f || h > 100.0f) {
+    dhtValid = false;
+    Serial.println(F("[WARN] DHT11 value out of range - T/H omitted."));
+    return;
+  }
+  lastTempC = t;
+  lastHum = h;
+  dhtValid = true;
+}
+
+// ---------------- rain ----------------
+const char* classifyRain(int raw) {
+  if (raw > RAIN_DRY_ABOVE)   return "DRY";
+  if (raw < RAIN_HEAVY_BELOW) return "HEAVY";
+  return "LIGHT";
+}
+
+// ---------------- water-level strip (Serial only) ----------------
+int readWaterLevelRaw() {
+  digitalWrite(WATER_PWR_PIN, HIGH);
+  delay(10);
+  int raw = readAnalogAvg(WATER_AO_PIN);
+  digitalWrite(WATER_PWR_PIN, LOW);
+  return raw;
+}
+
+int waterSensorPercent(int raw) {
+  if (WATER_RAW_FULL <= WATER_RAW_DRY) return -1;
+  long pct = map(raw, WATER_RAW_DRY, WATER_RAW_FULL, 0, 100);
+  return (int)constrain(pct, 0L, 100L);
+}
+
+const char* gradeWaterBySensor(int pct) {
+  if (pct < 0)  return "UNCALIBRATED";
+  if (pct < 5)  return "NONE";
+  if (pct < 40) return "LOW";
+  if (pct < 70) return "MEDIUM";
+  return "HIGH";
+}
+
+// ---------------- AI status ----------------
+// PLACEHOLDER: rule-based, NOT your Edge-AI model.
+// Replace the body with your model output ("NORMAL" or "FLOOD").
+const char* computeAiStatus(float distCm) {
+  static bool floodLatched = false;
+  static uint8_t streak = 0;
+
+  bool wantChange = floodLatched ? (distCm >= DANGER_DIST_CM + AI_RELEASE_MARGIN_CM)
+                                 : (distCm <= DANGER_DIST_CM);
+  if (wantChange) {
+    if (++streak >= AI_CONFIRM_SAMPLES) { floodLatched = !floodLatched; streak = 0; }
+  } else {
+    streak = 0;
+  }
+  return floodLatched ? "FLOOD" : "NORMAL";
+}
+
+// ---------------- LoRa ----------------
+bool initLoRa() {
+  pinMode(LORA_RST_PIN, OUTPUT);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(10);
+  digitalWrite(LORA_RST_PIN, LOW);  delay(20);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(50);
+
+  LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_SS_PIN);
+  LoRa.setSPIFrequency(2000000);
+
+  if (!LoRa.begin(LORA_BAND)) return false;
+  LoRa.setSyncWord(LORA_SYNC_WORD);   // everything else = library defaults, like the receiver
+  return true;
+}
+
+bool transmitPacket(const char *payload) {
+  if (!LoRa.beginPacket()) return false;
+  LoRa.print(payload);
+  return LoRa.endPacket() == 1;       // blocks until TX is done
+}
+
+// ---------------- payload ----------------
+bool buildPayload(char *buf, size_t size, float dist, const char *rain, const char *ai, int waterRaw) {
+  int n = snprintf(buf, size, "D:%.1f", dist);
+  if (n < 0 || (size_t)n >= size) return false;
+
+  if (dhtValid) {
+    int m = snprintf(buf + n, size - n, ",T:%.1f,H:%.1f", lastTempC, lastHum);
+    if (m < 0 || (size_t)(n + m) >= size) return false;
+    n += m;
+  }
+
+  int m = snprintf(buf + n, size - n, ",R:%s,A:%s", rain, ai);
+  if (m < 0 || (size_t)(n + m) >= size) return false;
+  n += m;
+
+#if SEND_WATER_LEVEL_FIELD
+  m = snprintf(buf + n, size - n, ",W:%d", waterRaw);
+  if (m < 0 || (size_t)(n + m) >= size) return false;
+#else
+  (void)waterRaw;
+#endif
+  return true;
+}
+
+// Same acceptance rules the receiver applies.
+bool payloadValidForReceiver(const char *p) {
+  if (strncmp(p, "D:", 2) != 0) return false;
+  float d = atof(p + 2);
+  if (!(d > 0.0f && d < 600.0f)) return false;
+  if (!strstr(p, ",R:") || !strstr(p, ",A:")) return false;
+  return strlen(p) < 200;
+}
+
+// ---------------- measure + send ----------------
+void measureAndSend() {
+  updateDht();
+
+  float dist     = readDistanceCm();
+  int   rainRaw  = readAnalogAvg(RAIN_AO_PIN);
+  int   waterRaw = readWaterLevelRaw();
+  int   waterPct = waterSensorPercent(waterRaw);
+  const char *rain = classifyRain(rainRaw);
+
+  Serial.println(F("------------------------------------------"));
+  if (isnan(dist)) {
+    Serial.println(F("Distance : INVALID"));
+  } else {
+    Serial.printf("Distance : %.1f cm (%s)\n", dist, gradeWaterByDistance(dist));
+    if (SENSOR_HEIGHT_CM > 0 && dist <= SENSOR_HEIGHT_CM)
+      Serial.printf("Water lvl: %.1f cm (calculated)\n", SENSOR_HEIGHT_CM - dist);
+  }
+  if (dhtValid) Serial.printf("Temp/Hum : %.1f C / %.1f %%\n", lastTempC, lastHum);
+  else          Serial.println(F("Temp/Hum : INVALID (not sent)"));
+  Serial.printf("Rain raw : %d -> %s\n", rainRaw, rain);
+  Serial.printf("WaterSens: raw %d | %d %% | %s (Serial only)\n",
+                waterRaw, waterPct, gradeWaterBySensor(waterPct));
+
+  if (isnan(dist)) {
+    packetsSkipped++;
+    Serial.printf("[SKIP #%lu] Ultrasonic failed - no packet sent.\n", packetsSkipped);
+    return;
+  }
+
+  char payload[96];
+  if (!buildPayload(payload, sizeof(payload), dist, rain, computeAiStatus(dist), waterRaw)) {
+    Serial.println(F("[ERROR] Payload build failed - not sent."));
+    return;
+  }
+  if (!payloadValidForReceiver(payload)) {
+    Serial.println(F("[ERROR] Payload would be rejected by receiver - not sent."));
+    return;
+  }
+
+  if (transmitPacket(payload)) {
+    packetsSent++;
+    consecutiveTxFails = 0;
+    Serial.printf("[TX #%lu OK] %s\n", packetsSent, payload);
+  } else {
+    consecutiveTxFails++;
+    Serial.printf("[TX FAILED] (%u in a row)\n", consecutiveTxFails);
+    if (consecutiveTxFails >= TX_FAILS_BEFORE_REINIT) {
+      Serial.println(F("Re-initializing LoRa..."));
+      Serial.println(initLoRa() ? F("LoRa re-init OK") : F("LoRa re-init FAILED"));
+      consecutiveTxFails = 0;
+    }
+  }
+}
+
+// ---------------- setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println(F("FALCON TRANSMITTER V2.1"));
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(WATER_PWR_PIN, OUTPUT);
+  digitalWrite(WATER_PWR_PIN, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(RAIN_AO_PIN, ADC_11db);
+  analogSetPinAttenuation(WATER_AO_PIN, ADC_11db);
+
+  dht.begin();
+
+  while (!initLoRa()) {
+    Serial.println(F("[CRITICAL] LoRa init failed - check wiring, 3.3V and antenna. Retrying..."));
+    delay(3000);
+  }
+  Serial.println(F("LoRa OK (433 MHz, sync 0x3F)"));
+
+  lastSend = millis() - SEND_INTERVAL_MS;   // first packet right away
+}
+
+void loop() {
+  if (millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = millis();
+    measureAndSend();
+  }
+}
