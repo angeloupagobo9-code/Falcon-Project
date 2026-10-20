@@ -1,0 +1,591 @@
+/*
+  FALCON FLOOD MONITORING - RECEIVER V3 (CORRECTED)
+  Board  : ESP32 Dev Module
+  Display: 1.3" I2C OLED SH1106 128x64
+  Radio  : LoRa SX1276/78 433 MHz
+  Payload from Transmitter:
+    D:<distance_cm>,T:<temp>,H:<humidity>,R:<DRY|LIGHT|HEAVY>,A:<NORMAL|FLOOD>
+  Example:
+    D:28.4,T:26.1,H:81.0,R:HEAVY,A:FLOOD
+*/
+
+#define USE_BLYNK 1
+
+#if USE_BLYNK
+  #define BLYNK_TEMPLATE_ID   "TMPL68yVUrxP9"
+  #define BLYNK_TEMPLATE_NAME "FALCON"
+  #define BLYNK_AUTH_TOKEN    "tU3aHcKtdw9jh3k6vc95flzxG2BdPxUz"
+#endif
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+#if USE_BLYNK
+  #include <WiFi.h>
+  #include <BlynkSimpleEsp32.h>
+#endif
+
+#if USE_BLYNK
+const char ssid[] = "Iphone 18 Pro Max";
+const char pass[] = "";   // open hotspot
+#endif
+
+// ---------- PINS ----------
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define LORA_SCK_PIN  18
+#define LORA_MISO_PIN 19
+#define LORA_MOSI_PIN 23
+#define LORA_SS_PIN   5
+#define LORA_RST_PIN  14
+#define LORA_DIO0_PIN 26
+
+#define BUZZER_PIN 25
+#define BUZZER_ACTIVE_HIGH true
+
+// ---------- RADIO ----------
+#define LORA_BAND      433E6
+#define LORA_SYNC_WORD 0x3F
+
+// ---------- WATER THRESHOLDS ----------
+const float SAFE_DIST_CM   = 30.0f;
+const float DANGER_DIST_CM = 14.0f;
+const uint8_t CONFIRM_SAMPLES = 2;
+
+// ---------- TIMERS ----------
+const unsigned long WARNING_BEEP_INTERVAL = 700;
+const unsigned long PACKET_TIMEOUT_MS     = 10000;
+const unsigned long TH_STALE_MS           = 15000;
+const unsigned long DISPLAY_PAGE_MS       = 3000;
+const unsigned long DISPLAY_REFRESH_MS    = 250;
+const unsigned long BLYNK_INTERVAL_MS     = 2000;
+
+// ---------- OLED ----------
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ---------- TELEMETRY ----------
+float rawDist = NAN;
+float filteredDist = NAN;
+float distHistory[3] = {NAN, NAN, NAN};
+uint8_t distIndex = 0;
+
+float tempC  = NAN;
+float humPct = NAN;
+unsigned long lastTHMillis = 0;
+
+String rainStat = "--";
+String aiStatus = "WAITING";
+String systemStatus = "WAITING";
+String fusionStatus = "WAIT";
+
+int lastRSSI = 0;
+unsigned long packetCount = 0;
+unsigned long lastPacketMillis = 0;
+
+uint8_t dangerCount  = 0;
+uint8_t aiFloodCount = 0;
+
+uint8_t buzzMode = 0;
+bool buzzerOn = false;
+unsigned long buzzerToggleTime = 0;
+
+unsigned long lastDisplayPage = 0;
+uint8_t displayPage = 0;
+
+// ---------- BUZZER ----------
+void buzzerWrite(bool state) {
+  digitalWrite(BUZZER_PIN, (state == BUZZER_ACTIVE_HIGH) ? HIGH : LOW);
+}
+
+void buzzerBegin() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerWrite(false);
+}
+
+// ---------- HELPERS ----------
+String upperTrim(String s) {
+  s.trim();
+  s.toUpperCase();
+  return s;
+}
+
+bool parseFloatStrict(String s, float &out) {
+  s.trim();
+  if (s.length() == 0) return false;
+  char *end = nullptr;
+  float v = strtof(s.c_str(), &end);
+  if (end == s.c_str() || *end != '\0') return false;
+  if (isnan(v) || isinf(v)) return false;
+  out = v;
+  return true;
+}
+
+float median3(float a, float b, float c) {
+  if (isnan(a)) return isnan(b) ? c : (isnan(c) ? b : (b < c ? b : c));
+  if (isnan(b)) return isnan(c) ? a : (a < c ? a : c);
+  if (isnan(c)) return (a < b ? a : b);
+  if (a > b) { float t = a; a = b; b = t; }
+  if (b > c) { float t = b; b = c; c = t; }
+  if (a > b) { float t = a; a = b; b = t; }
+  return b;
+}
+
+void resetDistanceFilter() {
+  for (uint8_t i = 0; i < 3; i++) distHistory[i] = NAN;
+  distIndex = 0;
+  filteredDist = NAN;
+}
+
+void updateDistanceFilter(float d) {
+  distHistory[distIndex] = d;
+  distIndex = (distIndex + 1) % 3;
+  float m = median3(distHistory[0], distHistory[1], distHistory[2]);
+  if (isnan(filteredDist)) filteredDist = m;
+  else filteredDist = m;  // fast response
+}
+
+bool isAI_Flood() {
+  return upperTrim(aiStatus).indexOf("FLOOD") >= 0;
+}
+
+bool isHeavyRain() {
+  return upperTrim(rainStat).indexOf("HEAVY") >= 0;
+}
+
+bool waterDanger() {
+  return !isnan(filteredDist) && filteredDist <= DANGER_DIST_CM;
+}
+
+bool waterWarning() {
+  return !isnan(filteredDist) &&
+         filteredDist > DANGER_DIST_CM &&
+         filteredDist < SAFE_DIST_CM;
+}
+
+bool packetFresh() {
+  return lastPacketMillis != 0 &&
+         (millis() - lastPacketMillis <= PACKET_TIMEOUT_MS);
+}
+
+bool thFresh() {
+  return packetFresh() && lastTHMillis != 0 &&
+         (millis() - lastTHMillis <= TH_STALE_MS) &&
+         !isnan(tempC) && !isnan(humPct);
+}
+
+// ---------- FUSION (Improved for buzzer) ----------
+void updateEvidenceCounters() {
+  if (waterDanger()) {
+    if (dangerCount < CONFIRM_SAMPLES) dangerCount++;
+  } else {
+    dangerCount = 0;
+  }
+
+  if (isAI_Flood()) {
+    if (aiFloodCount < CONFIRM_SAMPLES) aiFloodCount++;
+  } else {
+    aiFloodCount = 0;
+  }
+}
+
+void updateFusionDecision() {
+  if (!packetFresh()) {
+    dangerCount = 0;
+    aiFloodCount = 0;
+    systemStatus = "NO DATA";
+    fusionStatus = "LINK LOST";
+    return;
+  }
+
+  bool wf = waterDanger();
+  bool aw = isAI_Flood();
+
+  // Strong confirmed flood
+  if (dangerCount >= CONFIRM_SAMPLES && aiFloodCount >= CONFIRM_SAMPLES) {
+    systemStatus = "FLOOD";
+    fusionStatus = "CONFIRMED";
+  }
+  // AI alone confirmed several times
+  else if (aiFloodCount >= CONFIRM_SAMPLES) {
+    systemStatus = "FLOOD";
+    fusionStatus = "AI CONFIRMED";
+  }
+  // Water alone confirmed several times
+  else if (dangerCount >= CONFIRM_SAMPLES) {
+    systemStatus = "FLOOD";
+    fusionStatus = "WATER CONFIRMED";
+  }
+  else if (wf && aw) {
+    systemStatus = "WARNING";
+    fusionStatus = "CONFIRMING";
+  }
+  else if (wf) {
+    systemStatus = "WARNING";
+    fusionStatus = "WATER HIGH";
+  }
+  else if (aw) {
+    systemStatus = "WARNING";
+    fusionStatus = "AI FLOOD";
+  }
+  else if (waterWarning()) {
+    systemStatus = "WARNING";
+    fusionStatus = "RISING";
+  }
+  else if (isHeavyRain()) {
+    systemStatus = "WARNING";
+    fusionStatus = "HEAVY RAIN";
+  }
+  else {
+    systemStatus = "SAFE";
+    fusionStatus = "NORMAL";
+  }
+}
+
+// ---------- PARSE ----------
+bool parsePayload(const String &data) {
+  float newDist = NAN, newT = NAN, newH = NAN;
+  String newRain = "", newAI = "";
+
+  int start = 0;
+  int len = data.length();
+
+  while (start < len) {
+    int commaIdx = data.indexOf(',', start);
+    String token;
+    if (commaIdx == -1) {
+      token = data.substring(start);
+      start = len;
+    } else {
+      token = data.substring(start, commaIdx);
+      start = commaIdx + 1;
+    }
+
+    token.trim();
+    int colonIdx = token.indexOf(':');
+    if (colonIdx <= 0) continue;
+
+    String key = upperTrim(token.substring(0, colonIdx));
+    String value = token.substring(colonIdx + 1);
+    value.trim();
+
+    float f;
+    if (key == "D") {
+      if (parseFloatStrict(value, f) && f > 0.0f && f < 600.0f) newDist = f;
+    }
+    else if (key == "T") {
+      if (parseFloatStrict(value, f) && f > -20.0f && f < 70.0f) newT = f;
+    }
+    else if (key == "H") {
+      if (parseFloatStrict(value, f) && f >= 0.0f && f <= 100.0f) newH = f;
+    }
+    else if (key == "R") {
+      if (value.length() > 0) newRain = upperTrim(value);
+    }
+    else if (key == "A") {
+      if (value.length() > 0) newAI = upperTrim(value);
+    }
+  }
+
+  if (isnan(newDist)) {
+    Serial.println(F("[WARN] No valid D field"));
+    return false;
+  }
+
+  // Ignore failed DHT (0,0)
+  if (!isnan(newT) && !isnan(newH) && newT == 0.0f && newH == 0.0f) {
+    newT = NAN;
+    newH = NAN;
+  }
+
+  if (!packetFresh()) resetDistanceFilter();
+
+  rawDist = newDist;
+  updateDistanceFilter(newDist);
+
+  if (!isnan(newT) && !isnan(newH)) {
+    tempC = newT;
+    humPct = newH;
+    lastTHMillis = millis();
+  }
+
+  if (newRain.length()) rainStat = newRain;
+  if (newAI.length())   aiStatus = newAI;
+
+  lastPacketMillis = millis();
+  updateEvidenceCounters();
+  updateFusionDecision();
+  return true;
+}
+
+// ---------- BUZZER ----------
+void updateBuzzer() {
+  unsigned long now = millis();
+  uint8_t wanted = 0;
+
+  if (systemStatus == "FLOOD") wanted = 2;        // continuous
+  else if (systemStatus == "WARNING") wanted = 1; // beep
+
+  if (wanted != buzzMode) {
+    buzzMode = wanted;
+    buzzerToggleTime = now;
+    buzzerOn = (wanted != 0);
+    buzzerWrite(buzzerOn);
+    return;
+  }
+
+  if (buzzMode == 1 && now - buzzerToggleTime >= WARNING_BEEP_INTERVAL) {
+    buzzerOn = !buzzerOn;
+    buzzerWrite(buzzerOn);
+    buzzerToggleTime = now;
+  }
+  else if (buzzMode == 2) {
+    // keep continuous
+    if (!buzzerOn) {
+      buzzerOn = true;
+      buzzerWrite(true);
+    }
+  }
+  else if (buzzMode == 0) {
+    buzzerWrite(false);
+    buzzerOn = false;
+  }
+}
+
+// ---------- OLED ----------
+void drawHeader() {
+  u8g2.setFont(u8g2_font_5x7_tf);
+  u8g2.setCursor(0, 7);
+  u8g2.print("FALCON");
+  u8g2.setCursor(70, 7);
+  u8g2.print(lastRSSI);
+  u8g2.print("dBm");
+  u8g2.drawHLine(0, 9, 128);
+}
+
+void drawStatusBar(const String &text) {
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 52, 128, 12);
+  u8g2.setDrawColor(0);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setCursor(2, 61);
+  u8g2.print(text);
+  u8g2.setDrawColor(1);
+}
+
+void updateDisplay() {
+  if (millis() - lastDisplayPage >= DISPLAY_PAGE_MS) {
+    displayPage = (displayPage + 1) % 2;
+    lastDisplayPage = millis();
+  }
+
+  bool fresh = packetFresh();
+  u8g2.clearBuffer();
+  drawHeader();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  if (displayPage == 0) {
+    u8g2.setCursor(0, 19);
+    u8g2.print("WATER: ");
+    if (!fresh || isnan(filteredDist)) u8g2.print("--");
+    else {
+      u8g2.print(filteredDist, 1);
+      u8g2.print("cm");
+    }
+
+    u8g2.setCursor(0, 30);
+    u8g2.print("AI: ");
+    u8g2.print(fresh ? aiStatus : String("--"));
+
+    u8g2.setCursor(0, 41);
+    u8g2.print("RAIN: ");
+    u8g2.print(fresh ? rainStat : String("--"));
+
+    drawStatusBar("STATUS: " + systemStatus);
+  }
+  else {
+    u8g2.setCursor(0, 19);
+    u8g2.print("TEMP: ");
+    if (thFresh()) {
+      u8g2.print(tempC, 1);
+      u8g2.print("C");
+    } else u8g2.print("--");
+
+    u8g2.setCursor(0, 30);
+    u8g2.print("HUM: ");
+    if (thFresh()) {
+      u8g2.print(humPct, 0);
+      u8g2.print("%");
+    } else u8g2.print("--");
+
+    u8g2.setCursor(0, 41);
+    u8g2.print("FUSE: ");
+    u8g2.print(fusionStatus);
+
+    drawStatusBar("PKT: " + String(packetCount));
+  }
+
+  u8g2.sendBuffer();
+}
+
+// ---------- BLYNK ----------
+#if USE_BLYNK
+void sendToBlynk() {
+  if (WiFi.status() != WL_CONNECTED || !Blynk.connected()) return;
+
+  bool fresh = packetFresh();
+
+  Blynk.virtualWrite(V0, systemStatus);
+  Blynk.virtualWrite(V4, systemStatus);
+  Blynk.virtualWrite(V6, fresh ? "ONLINE" : "NO DATA");
+  Blynk.virtualWrite(V8, lastRSSI);
+  Blynk.virtualWrite(V9, packetCount);
+  Blynk.virtualWrite(V10, systemStatus == "FLOOD" ? "FLOOD DETECTED" : "NO FLOOD");
+  Blynk.virtualWrite(V12, fusionStatus);
+
+  if (fresh) {
+    if (!isnan(rawDist)) {
+      Blynk.virtualWrite(V1, rawDist);
+      Blynk.virtualWrite(V7, rawDist);
+    }
+    Blynk.virtualWrite(V5, rainStat);
+    Blynk.virtualWrite(V11, aiStatus);
+  }
+
+  if (thFresh()) {
+    Blynk.virtualWrite(V2, tempC);
+    Blynk.virtualWrite(V3, humPct);
+  }
+
+  static String prev = "";
+  if (systemStatus == "FLOOD" && prev != "FLOOD") {
+    Blynk.logEvent("flood_danger", "FALCON: FLOOD CONFIRMED");
+  }
+  prev = systemStatus;
+}
+#endif
+
+// ---------- LORA ----------
+bool initLoRa() {
+  pinMode(LORA_RST_PIN, OUTPUT);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(10);
+  digitalWrite(LORA_RST_PIN, LOW);  delay(20);
+  digitalWrite(LORA_RST_PIN, HIGH); delay(50);
+
+  LoRa.setPins(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_SS_PIN);
+  LoRa.setSPIFrequency(2000000);
+
+  if (!LoRa.begin(LORA_BAND)) return false;
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+  return true;
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  buzzerBegin();
+
+  // Startup beep test
+  buzzerWrite(true);  delay(200);
+  buzzerWrite(false); delay(150);
+  buzzerWrite(true);  delay(200);
+  buzzerWrite(false);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  u8g2.begin();
+  u8g2.setContrast(255);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(10, 30, "FALCON V3");
+  u8g2.sendBuffer();
+  delay(800);
+
+  while (!initLoRa()) {
+    Serial.println(F("LoRa init failed - check wiring"));
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 25, "LORA ERROR");
+    u8g2.sendBuffer();
+    delay(2000);
+  }
+  Serial.println(F("LoRa OK"));
+
+#if USE_BLYNK
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid);   // open network
+  Blynk.config(BLYNK_AUTH_TOKEN);
+#endif
+
+  Serial.println(F("FALCON RECEIVER V3 READY"));
+  updateDisplay();
+}
+
+// ---------- LOOP ----------
+void loop() {
+#if USE_BLYNK
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  } else {
+    static unsigned long lastWifiTry = 0;
+    if (millis() - lastWifiTry > 15000) {
+      lastWifiTry = millis();
+      WiFi.begin(ssid);
+    }
+  }
+
+  static unsigned long lastBlynkSend = 0;
+  if (millis() - lastBlynkSend >= BLYNK_INTERVAL_MS) {
+    lastBlynkSend = millis();
+    sendToBlynk();
+  }
+#endif
+
+  static unsigned long lastFusion = 0;
+  if (millis() - lastFusion >= 200) {
+    lastFusion = millis();
+    updateFusionDecision();
+  }
+
+  updateBuzzer();
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    packetCount++;
+    String incomingData;
+    while (LoRa.available()) {
+      incomingData += (char)LoRa.read();
+    }
+
+    lastRSSI = LoRa.packetRssi();
+    Serial.println(F("------------------------------------------"));
+    Serial.printf("[PACKET #%lu] %s\n", packetCount, incomingData.c_str());
+    Serial.printf("RSSI: %d dBm\n", lastRSSI);
+
+    if (incomingData.indexOf(':') >= 0 && parsePayload(incomingData)) {
+      Serial.printf("Status: %s | Fuse: %s | Dist: %.1f\n",
+                    systemStatus.c_str(), fusionStatus.c_str(), filteredDist);
+      updateBuzzer();
+      updateDisplay();
+#if USE_BLYNK
+      sendToBlynk();
+#endif
+    } else {
+      Serial.println(F("[WARN] Invalid packet"));
+    }
+  }
+
+  static unsigned long lastScreen = 0;
+  if (millis() - lastScreen >= DISPLAY_REFRESH_MS) {
+    lastScreen = millis();
+    updateDisplay();
+  }
+
+  delay(2);
+}
